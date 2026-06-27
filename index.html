@@ -2,8 +2,15 @@
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <title>Live Object Detector</title>
+  <link rel="manifest" href="manifest.webmanifest" />
+  <meta name="theme-color" content="#0b0f17" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Detector" />
+  <link rel="apple-touch-icon" href="icons/icon-192.png" />
   <style>
     :root { --accent: #22d3ee; --bg: #0b0f17; }
     * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
@@ -87,7 +94,52 @@
     const fpsEl = document.getElementById("fps");
 
     const PALETTE = ["#22d3ee","#34d399","#f59e0b","#f472b6","#a78bfa","#60a5fa","#fb7185","#fbbf24"];
-    let model = null, stream = null, facing = "environment", running = false, lastT = 0;
+    let model = null, stream = null, facing = "environment", running = false, lastT = 0, fpsAvg = 0;
+
+    // --- Temporal smoothing: match detections frame-to-frame and ease the
+    //     boxes with an EMA so they stop jittering. Tracks survive a few
+    //     missed frames so a one-frame dropout doesn't make a box blink. ---
+    const SMOOTH = 0.35;       // EMA weight for new measurement (lower = smoother)
+    const MATCH_IOU = 0.3;     // min IoU to consider two boxes the same object
+    const MAX_MISSES = 6;      // frames a track survives without a match
+    let tracks = [];
+    let nextId = 1;
+
+    function iou(a, b) {
+      const x1 = Math.max(a[0], b[0]), y1 = Math.max(a[1], b[1]);
+      const x2 = Math.min(a[0] + a[2], b[0] + b[2]), y2 = Math.min(a[1] + a[3], b[1] + b[3]);
+      const w = Math.max(0, x2 - x1), h = Math.max(0, y2 - y1);
+      const inter = w * h;
+      const uni = a[2] * a[3] + b[2] * b[3] - inter;
+      return uni > 0 ? inter / uni : 0;
+    }
+
+    function smooth(preds) {
+      const used = new Set();
+      for (const t of tracks) {
+        let best = -1, bestIoU = MATCH_IOU;
+        for (let i = 0; i < preds.length; i++) {
+          if (used.has(i) || preds[i].class !== t.class) continue;
+          const v = iou(t.bbox, preds[i].bbox);
+          if (v > bestIoU) { bestIoU = v; best = i; }
+        }
+        if (best >= 0) {
+          used.add(best);
+          const b = preds[best].bbox;
+          for (let k = 0; k < 4; k++) t.bbox[k] += SMOOTH * (b[k] - t.bbox[k]);
+          t.score += SMOOTH * (preds[best].score - t.score);
+          t.misses = 0;
+        } else {
+          t.misses++;
+        }
+      }
+      for (let i = 0; i < preds.length; i++) {
+        if (used.has(i)) continue;
+        tracks.push({ id: nextId++, class: preds[i].class, bbox: preds[i].bbox.slice(), score: preds[i].score, misses: 0 });
+      }
+      tracks = tracks.filter(t => t.misses <= MAX_MISSES);
+      return tracks;
+    }
 
     function fit() {
       const r = video.videoWidth / video.videoHeight || 16 / 9;
@@ -124,45 +176,53 @@
       fit();
     }
 
-    function draw(predictions) {
+    function draw(items) {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.lineWidth = Math.max(2, canvas.width / 320);
       ctx.font = `${Math.max(14, canvas.width / 45)}px -apple-system, sans-serif`;
       ctx.textBaseline = "top";
-      predictions.forEach((p, i) => {
-        const [x, y, w, h] = p.bbox;
-        const color = PALETTE[i % PALETTE.length];
+      for (const t of items) {
+        const [x, y, w, h] = t.bbox;
+        const color = PALETTE[t.id % PALETTE.length];   // stable colour per tracked object
         ctx.strokeStyle = color;
         ctx.strokeRect(x, y, w, h);
-        const text = `${p.class} ${(p.score * 100) | 0}%`;
+        const text = `${t.class} ${(t.score * 100) | 0}%`;
         const tw = ctx.measureText(text).width + 12;
         const th = parseInt(ctx.font) + 8;
         ctx.fillStyle = color;
         ctx.fillRect(x, Math.max(0, y - th), tw, th);
         ctx.fillStyle = "#06121a";
         ctx.fillText(text, x + 6, Math.max(0, y - th) + 4);
-      });
+      }
     }
 
     async function loop() {
       if (!running) return;
       if (canvas.width !== video.videoWidth && video.videoWidth) fit();
       const preds = await model.detect(video);
-      draw(preds);
+      const stable = smooth(preds);
+      draw(stable);
       dot.classList.add("live");
       const now = performance.now();
       const fps = lastT ? (1000 / (now - lastT)) : 0;
       lastT = now;
-      labelEl.textContent = preds.length ? `${preds.length} objet(s)` : "rien détecté";
-      fpsEl.textContent = `${fps.toFixed(0)} fps`;
+      fpsAvg = fpsAvg ? fpsAvg + 0.1 * (fps - fpsAvg) : fps;   // smoothed fps readout
+      labelEl.textContent = stable.length ? `${stable.length} objet(s)` : "rien détecté";
+      fpsEl.textContent = `${fpsAvg.toFixed(0)} fps`;
       requestAnimationFrame(loop);
     }
 
     go.addEventListener("click", start);
     document.getElementById("flip").addEventListener("click", async () => {
       facing = facing === "environment" ? "user" : "environment";
+      tracks = [];   // drop stale tracks when the view changes
       try { await openCamera(); } catch (e) {}
     });
+
+    // PWA: register the service worker so the app installs and shell-caches.
+    if ("serviceWorker" in navigator) {
+      window.addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => {}));
+    }
   </script>
 </body>
 </html>
