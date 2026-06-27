@@ -97,9 +97,12 @@
     let model = null, stream = null, facing = "environment", running = false, lastT = 0, fpsAvg = 0;
 
     // --- Temporal smoothing: match detections frame-to-frame and ease the
-    //     boxes with an EMA so they stop jittering. Tracks survive a few
-    //     missed frames so a one-frame dropout doesn't make a box blink. ---
-    const SMOOTH = 0.35;       // EMA weight for new measurement (lower = smoother)
+    //     boxes with an ADAPTIVE EMA — follow fast when the object moves a lot,
+    //     stabilise hard when it's still. Kills both jitter (static) and lag
+    //     (moving). Tracks survive a few missed frames so a dropout doesn't
+    //     make a box blink. ---
+    const EASE_MIN = 0.25;     // easing when the box barely moves (max stability)
+    const EASE_MAX = 0.85;     // easing when it moves a lot (max responsiveness)
     const MATCH_IOU = 0.3;     // min IoU to consider two boxes the same object
     const MAX_MISSES = 6;      // frames a track survives without a match
     let tracks = [];
@@ -126,8 +129,14 @@
         if (best >= 0) {
           used.add(best);
           const b = preds[best].bbox;
-          for (let k = 0; k < 4; k++) t.bbox[k] += SMOOTH * (b[k] - t.bbox[k]);
-          t.score += SMOOTH * (preds[best].score - t.score);
+          // adaptive easing from box-center displacement relative to box size
+          const cx0 = t.bbox[0] + t.bbox[2] / 2, cy0 = t.bbox[1] + t.bbox[3] / 2;
+          const cx1 = b[0] + b[2] / 2, cy1 = b[1] + b[3] / 2;
+          const dist = Math.hypot(cx1 - cx0, cy1 - cy0);
+          const sizeRef = Math.max(20, (t.bbox[2] + t.bbox[3]) / 2);
+          const a = Math.min(EASE_MAX, EASE_MIN + dist / sizeRef);
+          for (let k = 0; k < 4; k++) t.bbox[k] += a * (b[k] - t.bbox[k]);
+          t.score += 0.3 * (preds[best].score - t.score);
           t.misses = 0;
         } else {
           t.misses++;
@@ -152,7 +161,7 @@
       go.disabled = true;
       go.textContent = "Chargement du modèle…";
       try {
-        model = await cocoSsd.load({ base: "lite_mobilenet_v2" });
+        model = await cocoSsd.load({ base: "mobilenet_v2" });   // more accurate base (tighter boxes, fewer misses)
       } catch (e) {
         go.textContent = "Erreur chargement modèle";
         return;
@@ -199,7 +208,7 @@
     async function loop() {
       if (!running) return;
       if (canvas.width !== video.videoWidth && video.videoWidth) fit();
-      const preds = await model.detect(video);
+      const preds = await model.detect(video, 20, 0.4);   // up to 20 boxes, surface scores >= 0.40
       const stable = smooth(preds);
       draw(stable);
       dot.classList.add("live");
