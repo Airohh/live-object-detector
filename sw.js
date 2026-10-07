@@ -1,7 +1,7 @@
 // Minimal service worker: cache the app shell so the page opens offline and
 // installs as a PWA. The TensorFlow.js model + CDN libs are fetched network-
 // first (they need the network on first run, then the browser HTTP-caches them).
-const CACHE = "lod-v2";
+const CACHE = "lod-v3";
 const SHELL = [
   ".",
   "index.html",
@@ -25,10 +25,11 @@ self.addEventListener("fetch", (e) => {
   if (url.origin !== location.origin) return; // CDN/model weights: browser handles + HTTP-caches
 
   // HTML document: network-first so a redeploy shows up immediately; fall back
-  // to cache when offline.
+  // to cache when offline. cache: "no-cache" revalidates with the server —
+  // otherwise the HTTP cache (GitHub Pages: max-age=600) serves stale HTML.
   if (e.request.mode === "navigate" || url.pathname.endsWith("/") || url.pathname.endsWith("index.html")) {
     e.respondWith(
-      fetch(e.request)
+      fetch(e.request, { cache: "no-cache" })
         .then((r) => { const c = r.clone(); caches.open(CACHE).then((ca) => ca.put(e.request, c)); return r; })
         .catch(() => caches.match(e.request).then((r) => r || caches.match("index.html")))
     );
