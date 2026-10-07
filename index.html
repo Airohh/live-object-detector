@@ -102,12 +102,19 @@
     // --- Temporal smoothing: match detections frame-to-frame and ease the
     //     boxes with an ADAPTIVE EMA — follow fast when the object moves a lot,
     //     stabilise hard when it's still. Kills both jitter (static) and lag
-    //     (moving). Tracks survive a few missed frames so a dropout doesn't
-    //     make a box blink. ---
+    //     (moving). Anti-blink: score hysteresis (an object needs SCORE_SHOW to
+    //     appear but weaker detections keep it alive), global best-pair matching
+    //     with a centre-distance fallback for small boxes, no duplicate track on
+    //     top of an existing one, and tracks survive short dropouts. ---
     const EASE_MIN = 0.25;     // easing when the box barely moves (max stability)
     const EASE_MAX = 0.85;     // easing when it moves a lot (max responsiveness)
-    const MATCH_IOU = 0.3;     // min IoU to consider two boxes the same object
-    const MAX_MISSES = 6;      // frames a track survives without a match
+    const SCORE_SHOW = 0.4;    // score a new object needs to get a box
+    const SCORE_KEEP = 0.25;   // ...weaker detections still keep an existing box alive
+    const SCORE_INSTANT = 0.6; // confident objects show at once, others after MIN_HITS frames
+    const MIN_HITS = 2;        // kills one-frame false-positive flashes
+    const MATCH_SIM = 0.3;     // min similarity to consider two boxes the same object
+    const DUP_SIM = 0.5;       // unmatched detection this close to a track = duplicate
+    const MAX_MISS_MS = 500;   // a track survives this long without a match
     let tracks = [];
     let nextId = 1;
 
@@ -120,37 +127,48 @@
       return uni > 0 ? inter / uni : 0;
     }
 
-    function smooth(preds) {
-      const used = new Set();
-      for (const t of tracks) {
-        let best = -1, bestIoU = MATCH_IOU;
-        for (let i = 0; i < preds.length; i++) {
-          if (used.has(i) || preds[i].class !== t.class) continue;
-          const v = iou(t.bbox, preds[i].bbox);
-          if (v > bestIoU) { bestIoU = v; best = i; }
-        }
-        if (best >= 0) {
-          used.add(best);
-          const b = preds[best].bbox;
-          // adaptive easing from box-center displacement relative to box size
-          const cx0 = t.bbox[0] + t.bbox[2] / 2, cy0 = t.bbox[1] + t.bbox[3] / 2;
-          const cx1 = b[0] + b[2] / 2, cy1 = b[1] + b[3] / 2;
-          const dist = Math.hypot(cx1 - cx0, cy1 - cy0);
-          const sizeRef = Math.max(20, (t.bbox[2] + t.bbox[3]) / 2);
-          const a = Math.min(EASE_MAX, EASE_MIN + dist / sizeRef);
-          for (let k = 0; k < 4; k++) t.bbox[k] += a * (b[k] - t.bbox[k]);
-          t.score += 0.3 * (preds[best].score - t.score);
-          t.misses = 0;
-        } else {
-          t.misses++;
-        }
+    // IoU, or for small/jittery boxes (where IoU collapses on a few px of
+    // shift) closeness of the centres measured in box widths/heights.
+    function similarity(a, b) {
+      const dx = (a[0] + a[2] / 2 - b[0] - b[2] / 2) / Math.max(8, (a[2] + b[2]) / 2);
+      const dy = (a[1] + a[3] / 2 - b[1] - b[3] / 2) / Math.max(8, (a[3] + b[3]) / 2);
+      return Math.max(iou(a, b), 1 - Math.hypot(dx, dy));
+    }
+
+    // Returns the tracks to draw.
+    function smooth(preds, now) {
+      // best pairs first, so a track can't steal the detection of a closer one
+      const pairs = [];
+      tracks.forEach((t, ti) => preds.forEach((p, pi) => {
+        if (p.class !== t.class) return;
+        const s = similarity(t.bbox, p.bbox);
+        if (s >= MATCH_SIM) pairs.push([s, ti, pi]);
+      }));
+      pairs.sort((a, b) => b[0] - a[0]);
+      const tUsed = new Set(), pUsed = new Set();
+      for (const [, ti, pi] of pairs) {
+        if (tUsed.has(ti) || pUsed.has(pi)) continue;
+        tUsed.add(ti); pUsed.add(pi);
+        const t = tracks[ti], b = preds[pi].bbox;
+        // adaptive easing from box-center displacement relative to box size
+        const cx0 = t.bbox[0] + t.bbox[2] / 2, cy0 = t.bbox[1] + t.bbox[3] / 2;
+        const cx1 = b[0] + b[2] / 2, cy1 = b[1] + b[3] / 2;
+        const dist = Math.hypot(cx1 - cx0, cy1 - cy0);
+        const sizeRef = Math.max(20, (t.bbox[2] + t.bbox[3]) / 2);
+        const a = Math.min(EASE_MAX, EASE_MIN + dist / sizeRef);
+        for (let k = 0; k < 4; k++) t.bbox[k] += a * (b[k] - t.bbox[k]);
+        t.score += 0.3 * (preds[pi].score - t.score);
+        t.hits++;
+        t.seen = now;
       }
       for (let i = 0; i < preds.length; i++) {
-        if (used.has(i)) continue;
-        tracks.push({ id: nextId++, class: preds[i].class, bbox: preds[i].bbox.slice(), score: preds[i].score, misses: 0 });
+        const p = preds[i];
+        if (pUsed.has(i) || p.score < SCORE_SHOW) continue;
+        if (tracks.some(t => t.class === p.class && similarity(t.bbox, p.bbox) >= DUP_SIM)) continue;
+        tracks.push({ id: nextId++, class: p.class, bbox: p.bbox.slice(), score: p.score, hits: 1, seen: now });
       }
-      tracks = tracks.filter(t => t.misses <= MAX_MISSES);
-      return tracks;
+      tracks = tracks.filter(t => now - t.seen <= MAX_MISS_MS);
+      return tracks.filter(t => t.hits >= MIN_HITS || t.score >= SCORE_INSTANT);
     }
 
     function fit() {
@@ -252,11 +270,11 @@
     async function loop() {
       if (!running) return;
       if (canvas.width !== video.videoWidth && video.videoWidth) fit();
-      const preds = await model.detect(video, 20, 0.4);   // up to 20 boxes, surface scores >= 0.40
-      const stable = smooth(preds);
+      const preds = await model.detect(video, 20, SCORE_KEEP);   // up to 20 boxes; smooth() applies SCORE_SHOW to new ones
+      const now = performance.now();
+      const stable = smooth(preds, now);
       const shown = draw(stable);
       dot.classList.add("live");
-      const now = performance.now();
       const fps = lastT ? (1000 / (now - lastT)) : 0;
       lastT = now;
       fpsAvg = fpsAvg ? fpsAvg + 0.1 * (fps - fpsAvg) : fps;   // smoothed fps readout
