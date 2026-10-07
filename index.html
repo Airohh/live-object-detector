@@ -43,6 +43,7 @@
       box-shadow: 0 8px 30px rgba(34,211,238,.35); transition: transform .12s ease; }
     #go:active { transform: scale(.96); }
     #note { margin-top: 18px; font-size: 12px; color: #64748b; }
+    #err { margin: 16px auto 0; max-width: 320px; font-size: 13px; line-height: 1.4; color: #fbbf24; }
 
     /* bottom controls */
     #bar { position: fixed; bottom: env(safe-area-inset-bottom, 16px); left: 0; right: 0; z-index: 5;
@@ -75,6 +76,7 @@
       <h1>Live <span>Object</span> Detector</h1>
       <p>Détection d'objets en temps réel dans le navigateur. Le modèle tourne sur ton appareil — aucune image envoyée.</p>
       <button id="go">Activer la caméra</button>
+      <div id="err" class="hidden"></div>
       <div id="note">COCO-SSD · TensorFlow.js · 80 classes</div>
     </div>
   </div>
@@ -87,6 +89,7 @@
     const ctx = canvas.getContext("2d");
     const gate = document.getElementById("gate");
     const go = document.getElementById("go");
+    const errEl = document.getElementById("err");
     const hud = document.getElementById("hud");
     const bar = document.getElementById("bar");
     const dot = document.getElementById("dot");
@@ -157,16 +160,41 @@
       canvas.height = video.videoHeight || 720;
     }
 
+    function fail(msg) {
+      errEl.textContent = msg;
+      errEl.classList.remove("hidden");
+      go.disabled = false;
+      go.textContent = "Réessayer";
+    }
+
+    function cameraError(e) {
+      switch (e && e.name) {
+        case "NotAllowedError": return "Accès caméra refusé — autorise-la dans les réglages du navigateur.";
+        case "NotFoundError":
+        case "OverconstrainedError": return "Aucune caméra trouvée sur cet appareil.";
+        case "NotReadableError": return "Caméra déjà utilisée par une autre application.";
+        default: return "Caméra indisponible.";
+      }
+    }
+
     async function start() {
       go.disabled = true;
+      errEl.classList.add("hidden");
       go.textContent = "Chargement du modèle…";
       try {
-        model = await cocoSsd.load({ base: "mobilenet_v2" });   // more accurate base (tighter boxes, fewer misses)
+        // keep the model across retries — only the camera step usually fails
+        model = model || await cocoSsd.load({ base: "mobilenet_v2" });   // more accurate base (tighter boxes, fewer misses)
       } catch (e) {
-        go.textContent = "Erreur chargement modèle";
+        fail("Erreur de chargement du modèle — vérifie ta connexion.");
         return;
       }
-      await openCamera();
+      go.textContent = "Ouverture de la caméra…";
+      try {
+        await openCamera();
+      } catch (e) {
+        fail(cameraError(e));
+        return;
+      }
       gate.classList.add("hidden");
       hud.classList.remove("hidden");
       bar.classList.remove("hidden");
